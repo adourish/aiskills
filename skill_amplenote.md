@@ -2,7 +2,7 @@
 
 **Category:** API Integration
 **Complexity:** Intermediate
-**Last Updated:** 2026-05-08
+**Last Updated:** 2026-05-09
 
 ## Quick Reference
 **Use when:** Creating/reading/updating Amplenote notes via API, refreshing an expired token, migrating content  
@@ -20,10 +20,39 @@
 | Create note (metadata only) | `POST /v4/notes` | Body text in POST is **ignored** — only name + tags saved |
 | Set/replace note body | `PUT /v4/notes/{uuid}` | Returns 400 bad_request in practice — **use INSERT_NODES instead** |
 | Insert structured nodes | `POST /v4/notes/{uuid}/actions` | Use `INSERT_NODES` for all body content (text, tasks, headings, bullets) |
-| Read full note + body | `GET /v4/notes/{uuid}` | Returns body in `body` field (not `text`) |
+| Read full note + body | `GET /v4/notes/{uuid}` | Returns metadata only — body field is empty via REST |
 | List notes | `GET /v4/notes` | Returns metadata only — no body content |
 
 **Always add tags.** Notes without tags are hard to find. Tags go in the POST body as `[{"text": "tagname"}]`.
+
+---
+
+## ⚠️ INSERT_NODES PREPENDS — Critical Ordering Rule
+
+**INSERT_NODES inserts content at the TOP of the note, not the bottom.**
+
+Each batch call prepends its nodes before everything already in the note. If you call:
+- Batch 1 → note contains: [Batch 1]
+- Batch 2 → note contains: [Batch 2, Batch 1]  ← WRONG ORDER
+- Batch 3 → note contains: [Batch 3, Batch 2, Batch 1]  ← WRONG ORDER
+
+**Fix: iterate batches in reverse order** so the last batch goes in first and ends up at the bottom:
+
+```python
+batches = [nodes[i:i+15] for i in range(0, len(nodes), 15)]
+for batch in reversed(batches):          # <-- reversed!
+    action = json.dumps({'type': 'INSERT_NODES', 'nodes': batch}).encode()
+    req = urllib.request.Request(
+        f'https://api.amplenote.com/v4/notes/{uuid}/actions',
+        data=action,
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        pass  # 204 = success
+    time.sleep(0.3)
+```
+
+This ensures the final note reads top-to-bottom in the same order as your `nodes` list.
 
 ---
 
@@ -55,16 +84,16 @@ with urllib.request.urlopen(req, timeout=20) as r:
     uuid = result['uuid']
 ```
 
-### Step 3 — INSERT_NODES to write the body
+### Step 3 — INSERT_NODES in reverse batch order
 ```python
-lines = ["# My Heading", "", "Body text goes here.", "Second paragraph."]
 nodes = [
-    {'type': 'paragraph', 'content': [{'type': 'text', 'text': l if l.strip() else ' '}]}
-    for l in lines
+    {'type': 'heading', 'attrs': {'level': 2}, 'content': [{'type': 'text', 'text': 'Section 1'}]},
+    {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'First paragraph.'}]},
+    {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Second paragraph.'}]},
 ]
-# Insert in batches of 15
-for i in range(0, len(nodes), 15):
-    batch = nodes[i:i+15]
+
+batches = [nodes[i:i+15] for i in range(0, len(nodes), 15)]
+for batch in reversed(batches):          # reversed so content appears top-to-bottom in order
     action = json.dumps({'type': 'INSERT_NODES', 'nodes': batch}).encode()
     req = urllib.request.Request(
         f'https://api.amplenote.com/v4/notes/{uuid}/actions',
@@ -80,44 +109,26 @@ for i in range(0, len(nodes), 15):
 
 ---
 
-## Reading a Note Body
-
-```python
-req = urllib.request.Request(
-    f'https://api.amplenote.com/v4/notes/{uuid}',
-    headers={'Authorization': f'Bearer {token}'}
-)
-with urllib.request.urlopen(req, timeout=15) as r:
-    data = json.loads(r.read())
-    body = data.get('body', '')   # body field, NOT text
-```
-
----
-
-## INSERT_NODES — Rich Content (Tasks, Headings, Bullets)
+## INSERT_NODES — Node Types
 
 ```python
 nodes = [
+    # Heading (level 1-3)
     {'type': 'heading', 'attrs': {'level': 2}, 'content': [{'type': 'text', 'text': 'My Section'}]},
+    # Plain paragraph
     {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Some text here.'}]},
+    # Checklist / task item
     {'type': 'check_list_item', 'attrs': {}, 'content': [
         {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'A task item'}]}
     ]},
+    # Bullet
     {'type': 'bullet_list_item', 'content': [
         {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'A bullet'}]}
     ]},
 ]
-action = json.dumps({'type': 'INSERT_NODES', 'nodes': nodes}).encode()
-req = urllib.request.Request(
-    f'https://api.amplenote.com/v4/notes/{uuid}/actions',
-    data=action,
-    headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-)
-with urllib.request.urlopen(req, timeout=20) as r:
-    pass  # 204 = success
 ```
 
-Insert in batches of 15 nodes max to avoid API limits. Sleep 0.3s between batches.
+Max **15 nodes per batch**. Sleep **0.3s between batches**. Always iterate `reversed(batches)`.
 
 ---
 
@@ -215,6 +226,7 @@ with urllib.request.urlopen(req, timeout=15) as r:
 | 401 Unauthorized | Access token expired | Refresh token (Option A above) |
 | invalid_grant | Refresh token also expired | Full re-auth (Option B above) |
 | Note created but no body | Used `text` in POST body | Use INSERT_NODES after POST |
-| Body field empty on GET | Used wrong field name | Use `data.get('body', '')` not `text` |
+| Body field empty on GET | REST endpoint doesn't return body | Expected — body not exposed via GET |
 | PUT returns 400 | API doesn't support PUT body writes | Use INSERT_NODES instead |
 | INSERT_NODES fails | Batch too large | Split into batches of ≤15 nodes |
+| Content in wrong order (last section first) | INSERT_NODES prepends each batch | Iterate `reversed(batches)` — see ordering rule above |
